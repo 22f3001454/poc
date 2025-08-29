@@ -1,0 +1,305 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>LLM Agent POC — Single File</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body{background:#f6f7fb}
+    #chat { height:420px; overflow:auto; background:#fff; padding:1rem; border-radius:.5rem; box-shadow:0 1px 4px rgba(0,0,0,.06) }
+    .meta { font-size:.85rem; color:#666 }
+    .bubble { padding:.5rem .75rem; border-radius:.5rem; margin:.4rem 0; max-width:85% }
+    .user { background:#e7f1ff; align-self:flex-end }
+    .agent { background:#f1f1f1; align-self:flex-start }
+    .tool { background:#fff3cd; border:1px solid #ffeeba }
+    pre { white-space:pre-wrap; margin:0 }
+    #model { max-width:420px }
+    .row-flex { display:flex; gap:.5rem; align-items:center; }
+  </style>
+</head>
+<body class="container py-4">
+
+  <h3>LLM Agent POC — Browser (single file)</h3>
+
+  <div class="mb-3 row-flex">
+    <label class="form-label me-2">Model</label>
+    <select id="model" class="form-select" style="width:360px">
+      <option value="google/gemini-2.0-flash-lite-001">google/gemini-2.0-flash-lite</option>
+      <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
+    </select>
+    <button class="btn btn-outline-secondary" id="clear">Clear</button>
+  </div>
+
+  <div id="alert-area"></div>
+
+  <div id="chat" class="mb-3 d-flex flex-column"></div>
+
+  <div class="input-group mb-3">
+    <input id="input" type="text" class="form-control" placeholder="Ask the agent (e.g., 'Search IBM and then summarize')">
+    <button id="send" class="btn btn-primary">Send</button>
+  </div>
+
+  <small class="text-muted">Tool protocol: model must return JSON tool-calls in assistant content, e.g. {"tool":"search","args":{"q":"IBM"}}</small>
+
+<script>
+/* ========== CONFIG — change token ========== */
+const AIPIPE_CHAT_URL = "https://aipipe.org/openrouter/v1/chat/completions";
+const AIPIPE_BASE_OPENAI = "https://aipipe.org/openai/v1"; // for aipipe tool requests
+const AIPIPE_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6ImlhbXByYXZlZW5hMjkwMkBnbWFpbC5jb20ifQ.w3Gi1Ff0an9Cle4QIm9pyFGysw1ke1DM5EvZH6wG5NU"; // <-- INSERT TOKEN HERE
+/* ========================================== */
+
+const chatDiv = document.getElementById("chat");
+const modelSelect = document.getElementById("model");
+const inputEl = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const clearBtn = document.getElementById("clear");
+const alertArea = document.getElementById("alert-area");
+
+let messages = []; // conversation to send to LLM. We'll append tool results as {role:"tool", name, content}
+
+function showAlert(type, text, timeout=6000){
+  alertArea.innerHTML = `<div class="alert alert-${type}">${text}</div>`;
+  if(timeout) setTimeout(()=>{ alertArea.innerHTML = "" }, timeout);
+}
+
+function appendBubble(role, text, extraClass=""){
+  const wrapper = document.createElement("div");
+  wrapper.className = "d-flex " + (role==="user" ? "justify-content-end" : "justify-content-start");
+  const bubble = document.createElement("div");
+  bubble.className = "bubble " + (role==="user" ? "user" : "agent") + " " + extraClass;
+  bubble.innerHTML = text;
+  wrapper.appendChild(bubble);
+  chatDiv.appendChild(wrapper);
+  chatDiv.scrollTop = chatDiv.scrollHeight;
+}
+
+/* send conversation to AI Pipe chat completions */
+async function sendToModel() {
+  try {
+    const body = {
+      model: modelSelect.value,
+      messages: messages.map(m=>{
+        // transform 'tool' role into assistant/tool style if needed
+        if (m.role === 'tool') return { role: 'assistant', name: m.name, content: m.content };
+        return { role: m.role, content: m.content };
+      })
+    };
+    const resp = await fetch(AIPIPE_CHAT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type":"application/json",
+        "Authorization": `Bearer ${AIPIPE_TOKEN}`
+      },
+      body: JSON.stringify(body)
+    });
+    if(!resp.ok){
+      const txt = await resp.text();
+      throw new Error("Model API error: " + resp.status + " — " + txt);
+    }
+    const data = await resp.json();
+    // Expected structure: data.choices[0].message.content
+    const msg = data.choices?.[0]?.message;
+    if(!msg){ throw new Error("Unexpected model response"); }
+    const assistantContent = msg.content ?? "";
+    appendBubble("assistant", escapeHtml(assistantContent));
+    messages.push({ role: "assistant", content: assistantContent });
+
+    // try to parse a tool-call from assistantContent (strict JSON only)
+    const toolCalls = extractToolCalls(assistantContent);
+    if(toolCalls.length){
+      for(const tc of toolCalls){
+        await handleToolCall(tc);
+      }
+      // After tool results appended, continue the loop by sending conversation again (so model sees tool outputs)
+      // Safety: do not loop indefinitely — rely on model to stop calling tools.
+      await sendToModel(); // one recursive continuation
+    }
+  } catch(err){
+    console.error(err);
+    showAlert("danger", err.message || String(err), 10000);
+  }
+}
+
+/* Basic tool-call extractor:
+   The model must include a pure JSON object or an array of objects in the assistant content.
+   e.g. {"tool":"search","args":{"q":"IBM"}}
+   Or [{"tool":"search","args":{"q":"IBM"}},{"tool":"js","args":{"code":"2+2"}}]
+*/
+function extractToolCalls(text){
+  text = text.trim();
+  const out = [];
+  // Look for first '{' or '[' and attempt JSON.parse of the remainder up to final }/]
+  const firstBrace = text.indexOf('{');
+  const firstBracket = text.indexOf('[');
+  const start = (firstBrace === -1) ? firstBracket : (firstBracket === -1 ? firstBrace : Math.min(firstBrace, firstBracket));
+  if(start === -1) return out;
+  try{
+    // Try to find valid JSON substring by taking from start to end
+    const candidate = text.slice(start);
+    const parsed = JSON.parse(candidate);
+    if(Array.isArray(parsed)) for(const p of parsed) out.push(p);
+    else out.push(parsed);
+  }catch(e){
+    // parse failed; keep silent
+  }
+  return out;
+}
+
+/* Handle supported tools: search (DuckDuckGo), aipipe (proxy call), js (sandbox) */
+async function handleToolCall(tc){
+  const tool = tc.tool;
+  const args = tc.args || {};
+  appendBubble("assistant", `<div class="meta">[Tool requested: <b>${escapeHtml(tool)}</b>] ${escapeHtml(JSON.stringify(args))}</div>`, "tool");
+  let result;
+  try {
+    if(tool === "search"){
+      const q = args.q || args.query || "";
+      if(!q) throw new Error("search requires args.q");
+      result = await runSearch(q);
+    } else if(tool === "aipipe"){
+      // args should contain path and optionally method and body
+      result = await runAIPipe(args);
+    } else if(tool === "js"){
+      const code = args.code || args.src || "";
+      if(!code) throw new Error("js requires args.code");
+      result = await runJSInSandbox(code);
+    } else {
+      throw new Error("Unknown tool: " + tool);
+    }
+  } catch(err) {
+    result = { error: String(err) };
+  }
+
+  // append tool output as a 'tool' role message so model can see it
+  const toolContent = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+  appendBubble("assistant", `<div class="meta">[Tool output for <b>${escapeHtml(tool)}</b>]</div><pre>${escapeHtml(toolContent)}</pre>`, "tool");
+  messages.push({ role: "tool", name: tool, content: toolContent });
+}
+
+/* DuckDuckGo instant answer JSON for search snippets (no API key) */
+async function runSearch(q){
+  const url = "https://api.duckduckgo.com/?q=" + encodeURIComponent(q) + "&format=json&no_html=1&skip_disambig=1";
+  const r = await fetch(url);
+  if(!r.ok) throw new Error("Search fetch failed: "+r.status);
+  const j = await r.json();
+  // Build compact snippet set: Abstract + RelatedTopics first items
+  const snippets = [];
+  if(j.AbstractText) snippets.push({ title: j.Heading || "Summary", snippet: j.AbstractText, url: j.AbstractURL || "" });
+  if(Array.isArray(j.RelatedTopics)){
+    for(const t of j.RelatedTopics.slice(0,6)){
+      if(t.Text) snippets.push({ title: t.FirstURL || t.Name || "Related", snippet: t.Text, url: t.FirstURL || ""});
+      else if(t.Topics) for(const s of t.Topics.slice(0,2)) snippets.push({ title: s.FirstURL || s.Name || "Related", snippet: s.Text || s.Name, url: s.FirstURL || ""});
+    }
+  }
+  if(snippets.length===0) snippets.push({ title:"No results", snippet:"No snippet returned", url:"" });
+  return { query:q, results: snippets };
+}
+
+/* AIPipe arbitrary proxy call: args = { method, path, body }
+   Path is appended to AIPIPE_BASE_OPENAI (or full URL if starts with http)
+*/
+async function runAIPipe(args){
+  const method = (args.method || 'POST').toUpperCase();
+  const path = args.path || args.endpoint || "/embeddings";
+  const payload = args.body || args.payload || {};
+  const fullUrl = path.startsWith("http") ? path : (AIPIPE_BASE_OPENAI + path);
+  const r = await fetch(fullUrl, {
+    method,
+    headers: {
+      "Content-Type":"application/json",
+      "Authorization": `Bearer ${AIPIPE_TOKEN}`
+    },
+    body: (method === "GET" || method === "HEAD") ? undefined : JSON.stringify(payload)
+  });
+  if(!r.ok){
+    const txt = await r.text();
+    throw new Error("AIPipe proxy error: "+r.status + " — " + txt.slice(0,1000));
+  }
+  const j = await r.json().catch(()=> null);
+  if(j) return j;
+  return await r.text();
+}
+
+/* Run JS in a sandboxed iframe. Returns console.log outputs and final value or error.
+   This creates an iframe with sandbox="allow-scripts" and sends back messages via postMessage.
+*/
+function runJSInSandbox(code){
+  return new Promise((resolve)=>{
+    const iframe = document.createElement("iframe");
+    iframe.sandbox = "allow-scripts";
+    iframe.style.display = "none";
+    document.body.appendChild(iframe);
+
+    const id = "frame_" + Date.now() + "_" + Math.random().toString(36).slice(2);
+    const timeout = setTimeout(()=> {
+      cleanup();
+      resolve({ error: "timeout (5s)" });
+    }, 5000);
+
+    function cleanup(){
+      clearTimeout(timeout);
+      window.removeEventListener("message", onmsg);
+      try{ document.body.removeChild(iframe) }catch(e){}
+    }
+
+    function onmsg(ev){
+      if(!ev.data || ev.data._sandbox_id !== id) return;
+      cleanup();
+      resolve(ev.data.result);
+    }
+    window.addEventListener("message", onmsg);
+
+    const wrapped = `
+      <script>
+        (function(){
+          const sandbox_id = "${id}";
+          const outputs = [];
+          function send(obj){ parent.postMessage({ _sandbox_id: sandbox_id, result: obj }, "*"); }
+          try{
+            const console = {
+              log: function(){ outputs.push({type:"log", args:Array.from(arguments)}) },
+              error: function(){ outputs.push({type:"error", args:Array.from(arguments)}) }
+            };
+            // run user's code and capture returned value
+            let __ret = (function(){ ${code} })();
+            // if __ret is a Promise, await it
+            if(__ret && typeof __ret.then === 'function'){
+              __ret.then(v => send({ value:v, console: outputs })).catch(e=> send({ error: String(e), console: outputs }));
+            } else {
+              send({ value: __ret, console: outputs });
+            }
+          } catch(e){
+            send({ error: String(e), console: outputs });
+          }
+        })();
+      <\/script>
+    `;
+    const doc = iframe.contentWindow.document;
+    doc.open();
+    doc.write(wrapped);
+    doc.close();
+  });
+}
+
+/* UI handlers */
+sendBtn.onclick = async function(){
+  const text = inputEl.value.trim();
+  if(!text) return;
+  appendBubble("user", escapeHtml(text));
+  messages.push({ role: "user", content: text });
+  inputEl.value = "";
+  await sendToModel();
+};
+
+clearBtn.onclick = function(){
+  messages = [];
+  chatDiv.innerHTML = "";
+  showAlert("success", "Conversation cleared", 2000);
+};
+
+/* small util */
+function escapeHtml(s){ if(typeof s !== "string") s = String(s); return s.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"); }
+
+</script>
+</body>
+</html>
